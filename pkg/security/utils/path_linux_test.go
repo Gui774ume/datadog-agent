@@ -244,6 +244,41 @@ func TestPathPatternMatch(t *testing.T) {
 	}
 }
 
+func TestPatternMatch(t *testing.T) {
+	tests := []struct {
+		Pattern        string
+		Path           string
+		Opts           PathPatternMatchOpts
+		ExpectedResult bool
+	}{
+		{
+			Pattern:        " -c chmod +x /tmp/.ICEd-unix/XQYuP",
+			Path:           " -c chmod +x /tmp/kdevtmpfsi",
+			Opts:           PathPatternMatchOpts{WildcardLimit: 1, PrefixNodeRequired: 1, NodeSizeLimit: 20},
+			ExpectedResult: false,
+		},
+		{
+			Pattern:        " -c chmod +x /tmp/.ICEd-unix/XQYuP",
+			Path:           " -c chmod +x /tmp/.ICEd-unix/sqmgs",
+			Opts:           PathPatternMatchOpts{WildcardLimit: 1, PrefixNodeRequired: 1, NodeSizeLimit: 20},
+			ExpectedResult: true,
+		},
+		{
+			Pattern:        "/root/ /root /home -maxdepth 3 -name id_rsa*",
+			Path:           "/root/ /root /home -maxdepth 3 -name id_rsa*",
+			Opts:           PathPatternMatchOpts{WildcardLimit: 1, PrefixNodeRequired: 1, NodeSizeLimit: 20},
+			ExpectedResult: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("test", func(t *testing.T) {
+			r := PatternMatch(test.Pattern, test.Path, test.Opts, ' ')
+			assert.Equal(t, test.ExpectedResult, r, "%s vs %s", test.Pattern, test.Path)
+		})
+	}
+}
+
 func BenchmarkPathPatternBuilder(b *testing.B) {
 	b.Run("pattern", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {

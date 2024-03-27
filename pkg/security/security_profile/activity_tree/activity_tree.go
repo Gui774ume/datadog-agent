@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -180,6 +181,13 @@ func (at *ActivityTree) ComputeActivityTreeStats() {
 	pnodes := at.ProcessNodes
 	var fnodes []*FileNode
 
+	// reset
+	at.Stats.ProcessNodes = 0
+	at.Stats.FileNodes = 0
+	at.Stats.DNSNodes = 0
+	at.Stats.SocketNodes = 0
+	at.Stats.SyscallsCount = 0
+
 	for len(pnodes) > 0 {
 		node := pnodes[0]
 
@@ -188,6 +196,7 @@ func (at *ActivityTree) ComputeActivityTreeStats() {
 
 		at.Stats.DNSNodes += int64(len(node.DNSNames))
 		at.Stats.SocketNodes += int64(len(node.Sockets))
+		at.Stats.SyscallsCount += int64(len(node.Syscalls))
 
 		for _, f := range node.Files {
 			fnodes = append(fnodes, f)
@@ -334,7 +343,8 @@ func (at *ActivityTree) insertEvent(event *model.Event, dryRun bool, insertMissi
 		node.MatchedRules = model.AppendMatchedRule(node.MatchedRules, event.Rules)
 		return newProcessNode, nil
 	case model.FileOpenEventType:
-		return node.InsertFileEvent(&event.Open.File, event, generationType, at.Stats, dryRun, at.pathsReducer, resolvers), nil
+		newEntry, _ := node.InsertFileEvent(&event.Open.File, event, generationType, at.Stats, dryRun, at.pathsReducer, resolvers)
+		return newEntry, nil
 	case model.DNSEventType:
 		return node.InsertDNSEvent(event, generationType, at.Stats, at.DNSNames, dryRun, at.DNSMatchMaxDepth), nil
 	case model.BindEventType:
@@ -765,4 +775,261 @@ func (at *ActivityTree) Snapshot(newEvent func() *model.Event) {
 // SendStats sends the tree statistics
 func (at *ActivityTree) SendStats(client statsd.ClientInterface) error {
 	return at.Stats.SendStats(client, at.treeType)
+}
+
+const (
+	ProcessMatchWeight     int = 100
+	FileMatchWeight        int = 5
+	OrderedFileMatchWeight int = 100
+	OrderedFileMinLength   int = 10
+	DNSMatchWeight         int = 100
+	SyscallMatchWeight     int = 1
+	SocketMatchWeight      int = 5
+)
+
+type ScoreDetail struct {
+	ProcessScore  int
+	ProcessBase   int
+	FileScore     int
+	FileBase      int
+	DNSScore      int
+	DNSBase       int
+	SocketScore   int
+	SocketBase    int
+	SyscallsScore int
+	SyscallsBase  int
+}
+
+// String returns a string representation of ScoreDetail
+func (d *ScoreDetail) String() string {
+	return fmt.Sprintf(
+		"{Process:%d/%d File:%d/%d DNS:%d/%d Socket:%d/%d}",
+		d.ProcessScore,
+		d.ProcessBase,
+		d.FileScore,
+		d.FileBase,
+		d.DNSScore,
+		d.DNSBase,
+		d.SocketScore,
+		d.SocketBase)
+}
+
+// Add adds the input score to the current score
+func (d *ScoreDetail) Add(score *ScoreDetail) {
+	d.ProcessScore += score.ProcessScore
+	d.FileScore += score.FileScore
+	d.DNSScore += score.DNSScore
+	d.SocketScore += score.SocketScore
+}
+
+// Total counts the total score
+func (d *ScoreDetail) Total() int {
+	return d.ProcessScore + d.FileScore + d.DNSScore + d.SocketScore
+}
+
+// FillBases fills the bases from the provided signature
+func (d *ScoreDetail) FillBases(sig *ActivityTree) {
+	d.ProcessBase = sig.Stats.ComputeProcessSignatureBase()
+	d.FileBase = sig.Stats.ComputeFileSignatureBase()
+	d.DNSBase = sig.Stats.ComputeDNSSignatureBase()
+	d.SocketBase = sig.Stats.ComputeSocketSignatureBase()
+	d.SyscallsBase = sig.Stats.ComputeSyscallsBase()
+}
+
+// LookupSignature lookup the provided signature in the current tree. Returns the node with the highest score and its
+// score. Each process node is tagged with its score. The score per node is stored as a new "MatchedRules" as so:
+//   - RuleID will contain the name of the signature
+//   - RuleTags will have an entry called "score" containing the score and an entry called "base" containing the maximum
+//     points that can be scored for this signature
+func (at *ActivityTree) LookupSignature(sig *ActivityTree, name string) (*ScoreDetail, *ProcessNode, error) {
+	// in a signature, the malware is always the top level root process
+	malware := sig.ProcessNodes[0]
+	var base int
+	outputScore := &ScoreDetail{}
+	var outputNode *ProcessNode
+	var outputMatchingGraph *ProcessNode
+
+	// compute signature stats
+	sig.ComputeActivityTreeStats()
+	base = sig.Stats.ComputeSignatureBase()
+
+	// try to find the malware within the processes of the tree
+	processNodes := make([]*ProcessNode, len(at.ProcessNodes))
+	copy(processNodes, at.ProcessNodes)
+	for len(processNodes) > 0 {
+		node := processNodes[0]
+		processNodes = processNodes[1:]
+		if len(node.Children) > 0 {
+			processNodes = append(processNodes, node.Children...)
+		}
+
+		// compute the matching score between node and malware
+		matchingGraph := NewProcessNode(&model.ProcessCacheEntry{
+			ProcessContext: model.ProcessContext{
+				Process: node.Process,
+			},
+		}, Snapshot, nil)
+		nodeScore := at.lookupProcessSignature(node, malware, matchingGraph)
+
+		// update the dump score if need be
+		if outputScore.Total() <= nodeScore.Total() {
+			// set bases
+			nodeScore.FillBases(sig)
+
+			outputScore = nodeScore
+			outputNode = node
+			outputMatchingGraph = matchingGraph
+		}
+
+		// add the score to the node
+		tag := model.MatchedRule{
+			RuleID: name,
+			RuleTags: map[string]string{
+				"score": fmt.Sprintf("%d", nodeScore),
+				"base":  fmt.Sprintf("%d", base),
+			},
+			PolicyName: "signature",
+		}
+		node.MatchedRules = append(node.MatchedRules, &tag)
+	}
+
+	// print out matching graph
+	fmt.Println("======================= MATCHING GRAPH ============================")
+	outputMatchingGraph.debug(os.Stdout, "  ")
+	fmt.Println("===================================================================")
+
+	return outputScore, outputNode, nil
+}
+
+func (at *ActivityTree) lookupFileSignature(node *ProcessNode, signature *ProcessNode, matchingGraph *ProcessNode) int {
+	// reorder the files in the signature
+	var orderedSignatureFiles []*FileNode
+	iterator := []map[string]*FileNode{
+		signature.Files,
+	}
+	for len(iterator) > 0 {
+		n := iterator[0]
+		iterator = iterator[1:]
+		for _, elem := range n {
+			if len(elem.Children) == 0 {
+				orderedSignatureFiles = append(orderedSignatureFiles, elem)
+			} else {
+				iterator = append(iterator, elem.Children)
+			}
+		}
+	}
+
+	sort.Slice(orderedSignatureFiles, func(i, j int) bool {
+		return orderedSignatureFiles[i].FirstSeen.UnixNano() < orderedSignatureFiles[j].FirstSeen.UnixNano()
+	})
+
+	// compute score
+	var last time.Time
+	var streak, score int
+	for _, f := range orderedSignatureFiles {
+		// check if f is node
+		newEntry, n := node.InsertFileEvent(f.File, nil, Snapshot, at.Stats, true, at.pathsReducer, nil)
+		if !newEntry {
+			matchingGraph.InsertFileEvent(f.File, nil, Snapshot, &Stats{}, false, at.pathsReducer, nil)
+			if n.FirstSeen.After(last) {
+				streak++
+				if streak == OrderedFileMinLength {
+					// readjust the score to take into account the streak from the past 4 nodes
+					score += (OrderedFileMatchWeight - FileMatchWeight) * (OrderedFileMinLength - 1)
+					// add the score of the current node
+					score += OrderedFileMatchWeight
+				} else if streak > OrderedFileMinLength {
+					score += OrderedFileMatchWeight
+				} else {
+					score += FileMatchWeight
+				}
+			} else {
+				streak = 0
+				score += FileMatchWeight
+			}
+			last = n.FirstSeen
+		}
+	}
+
+	return score
+}
+
+func (at *ActivityTree) lookupProcessSignature(node *ProcessNode, signature *ProcessNode, matchingGraph *ProcessNode) *ScoreDetail {
+	details := &ScoreDetail{}
+
+	// check files
+	details.FileScore = at.lookupFileSignature(node, signature, matchingGraph)
+
+	// // check syscalls
+	// for _, s := range signature.Syscalls {
+	// 	if slices.Contains(node.Syscalls, s) {
+	// 		score += SyscallMatchWeight
+	// 	}
+	// }
+
+	// check domains
+	for name := range signature.DNSNames {
+		if node.DNSNames[name] != nil {
+			details.DNSScore += DNSMatchWeight
+			matchingGraph.DNSNames[name] = signature.DNSNames[name]
+		}
+	}
+
+	// check sockets
+	for _, sock := range signature.Sockets {
+	nodeSocketsLoop:
+		for _, nodeSock := range node.Sockets {
+			if sock.Family == nodeSock.Family {
+				for _, bind := range sock.Bind {
+					for _, nodeBind := range nodeSock.Bind {
+						if bind.IP == nodeBind.IP && bind.Port == nodeBind.Port {
+							details.SocketScore += SocketMatchWeight
+							matchingGraph.Sockets = append(matchingGraph.Sockets, sock)
+							break nodeSocketsLoop
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for _, sigChild := range signature.Children {
+		// fmt.Println("looking for", sigChild.Process.FileEvent.PathnameStr, sigChild.Process.Argv)
+		var childMatchingScore *ScoreDetail
+		var childMatchingGraph *ProcessNode
+		for _, n := range node.Children {
+			// fmt.Println("  checking against", n.Process.FileEvent.PathnameStr, n.Process.Argv)
+			if sigChild.Matches(&n.Process, true, true) {
+				// fmt.Println("    YES")
+
+				newMatchingChildGraph := NewProcessNode(&model.ProcessCacheEntry{
+					ProcessContext: model.ProcessContext{
+						Process: sigChild.Process,
+					},
+				}, Snapshot, nil)
+				score := at.lookupProcessSignature(n, sigChild, newMatchingChildGraph)
+
+				if childMatchingScore == nil || score.Total() > childMatchingScore.Total() {
+					if childMatchingGraph != nil {
+						// fmt.Printf("    switching to %s for %s (total of %d > %d)\n", n.Process.FileEvent.PathnameStr, sigChild.Process.FileEvent.PathnameStr, score.Total(), childMatchingScore.Total())
+					} else {
+						// fmt.Printf("    choosing %s for %s\n", n.Process.FileEvent.PathnameStr, sigChild.Process.FileEvent.PathnameStr)
+					}
+					childMatchingScore = score
+					childMatchingGraph = newMatchingChildGraph
+				}
+
+			} else {
+				// fmt.Println("    NO")
+			}
+		}
+		if childMatchingScore != nil {
+			details.ProcessScore += ProcessMatchWeight
+			matchingGraph.Children = append(matchingGraph.Children, childMatchingGraph)
+			details.Add(childMatchingScore)
+		} else {
+			// fmt.Printf("  MISSING %s -> %s %v\n", signature.Process.FileEvent.PathnameStr, sigChild.Process.FileEvent.PathnameStr, sigChild.Process.Argv)
+		}
+	}
+	return details
 }

@@ -11,7 +11,10 @@ package runtime
 import (
 	"fmt"
 	"os"
+	"path"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/fx"
@@ -49,6 +52,10 @@ type activityDumpCliParams struct {
 	remoteStorageFormats     []string
 	remoteStorageCompression bool
 	remoteRequest            bool
+	input                    string
+	inputDir                 string
+	signature                string
+	signatureDir             string
 }
 
 func activityDumpCommands(globalParams *command.GlobalParams) []*cobra.Command {
@@ -61,6 +68,7 @@ func activityDumpCommands(globalParams *command.GlobalParams) []*cobra.Command {
 	activityDumpCmd.AddCommand(listCommands(globalParams)...)
 	activityDumpCmd.AddCommand(stopCommands(globalParams)...)
 	activityDumpCmd.AddCommand(diffCommands(globalParams)...)
+	activityDumpCmd.AddCommand(signatureCommands(globalParams)...)
 	return []*cobra.Command{activityDumpCmd}
 }
 
@@ -279,6 +287,168 @@ func generateEncodingCommands(globalParams *command.GlobalParams) []*cobra.Comma
 	)
 
 	return []*cobra.Command{activityDumpGenerateEncodingCmd}
+}
+
+func signatureCommands(globalParams *command.GlobalParams) []*cobra.Command {
+	signatureCmd := &cobra.Command{
+		Use:   "signature",
+		Short: "signature related commands for activity dumps",
+	}
+
+	signatureCmd.AddCommand(matchSignatureCommand(globalParams)...)
+	return []*cobra.Command{signatureCmd}
+}
+
+func matchSignatureCommand(globalParams *command.GlobalParams) []*cobra.Command {
+	cliParams := &activityDumpCliParams{
+		GlobalParams: globalParams,
+	}
+
+	matchSignatureCmd := &cobra.Command{
+		Use:   "match",
+		Short: "returns a score indicating how similar the input dump is compared to the input signature",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return fxutil.OneShot(matchSignatureActivityDump,
+				fx.Supply(cliParams),
+				core.Bundle(),
+			)
+		},
+	}
+
+	matchSignatureCmd.Flags().StringVar(
+		&cliParams.input,
+		flags.Input,
+		"",
+		"an activity dump to analyze",
+	)
+	matchSignatureCmd.Flags().StringVar(
+		&cliParams.inputDir,
+		flags.InputDir,
+		"",
+		"a directory containing activity dumps to analyze",
+	)
+	matchSignatureCmd.Flags().StringVar(
+		&cliParams.signature,
+		flags.Signature,
+		"",
+		"the signature to look up in the input dump",
+	)
+	matchSignatureCmd.Flags().StringVar(
+		&cliParams.signatureDir,
+		flags.SignatureDir,
+		"",
+		"a folder containing a list of signatures to analyze",
+	)
+
+	return []*cobra.Command{matchSignatureCmd}
+}
+
+func parseActivityDumpList(fileInput string, dirInput string) ([]*dump.ActivityDump, error) {
+	var input []*dump.ActivityDump
+	if len(fileInput) > 0 {
+		ad := dump.NewEmptyActivityDump(nil)
+		if err := ad.Decode(fileInput); err != nil {
+			return nil, err
+		}
+		input = append(input, ad)
+	} else if len(dirInput) > 0 {
+		files, err := os.ReadDir(dirInput)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't open dump directory: %w", err)
+		}
+
+		for _, f := range files {
+			ad := dump.NewEmptyActivityDump(nil)
+			if err = ad.Decode(path.Join(dirInput, f.Name())); err != nil {
+				return nil, err
+			}
+			input = append(input, ad)
+		}
+	}
+	return input, nil
+}
+
+func matchSignatureActivityDump(args *activityDumpCliParams) error {
+	start := time.Now()
+	threshold := float64(25)
+
+	if len(args.input) == 0 && len(args.inputDir) == 0 {
+		return fmt.Errorf("an input dump or dumps directory is required")
+	}
+	if len(args.signature) == 0 && len(args.signatureDir) == 0 {
+		return fmt.Errorf("an input signature or signatures directory is required")
+	}
+
+	// parse input dump(s)
+	dumps, err := parseActivityDumpList(args.input, args.inputDir)
+	if err != nil {
+		return err
+	}
+
+	// parse input signature(s)
+	signatures, err := parseActivityDumpList(args.signature, args.signatureDir)
+	if err != nil {
+		return err
+	}
+
+	containerNames := make(map[string]bool)
+	imageIDs := make(map[string]bool)
+	var matches int
+
+	// Match each dump against the list of signatures
+	var toPrint string
+	for i, d := range dumps {
+		for _, t := range d.Tags {
+			if strings.HasPrefix(t, "kube_container_name") {
+				containerNames[t] = true
+			}
+			if strings.HasPrefix(t, "image_id") {
+				imageIDs[t] = true
+			}
+		}
+
+		// d.ActivityTree.Debug(os.Stdout)
+
+		// set differentiate args to true
+		d.ActivityTree.DifferentiateArgs()
+		var toPrintTmp string
+		for _, sig := range signatures {
+			//sig.ActivityTree.Debug(os.Stdout)
+			sig.ActivityTree.ComputeActivityTreeStats()
+			score, n, err := d.ActivityTree.LookupSignature(sig.ActivityTree, sig.Name)
+			if err != nil {
+				return fmt.Errorf("error while matching signature %s with dump %s: %v", err, sig.Name, d.Name)
+			}
+			percent := float64(score.Total()) / float64(sig.ActivityTree.Stats.ComputeSignatureBase()) * 100
+			if percent > threshold {
+				toPrintTmp += fmt.Sprintf(" - match:%f%% (%d/%d) details:%+v signature:%s node:%s\n", percent, score.Total(), sig.ActivityTree.Stats.ComputeSignatureBase(), score, sig.Name, n.Process.FileEvent.PathnameStr)
+			}
+			fmt.Printf("(%d/%d) current score: %f%%\n", i, len(dumps), percent)
+		}
+		if len(toPrintTmp) > 0 {
+			matches++
+			toPrint += fmt.Sprintf("Analyzing dump %s:\n%s", d.Name, toPrintTmp)
+		}
+	}
+	end := time.Now()
+
+	fmt.Println("================ RESULTS ================")
+	fmt.Println(toPrint)
+	fmt.Println()
+
+	fmt.Println("Scanned services:")
+	for t := range containerNames {
+		fmt.Println(t[len("kube_container_name")+1:])
+	}
+	fmt.Println()
+	fmt.Println("Scanned images:")
+	for t := range imageIDs {
+		fmt.Println(t[len("image_id")+1:])
+	}
+	fmt.Println()
+	fmt.Printf("Found %d matches (%f%% match threshold) in %s, across %d images, %d services and %d dumps.\n", matches, threshold, end.Sub(start), len(imageIDs), len(containerNames), len(dumps))
+	fmt.Println()
+	return nil
 }
 
 func diffCommands(globalParams *command.GlobalParams) []*cobra.Command {

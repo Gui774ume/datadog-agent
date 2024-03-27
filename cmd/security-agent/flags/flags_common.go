@@ -59,6 +59,9 @@ const (
 	Remote            = "remote"             // Remote activity dump subcommand
 	Origin            = "origin"             // Origin activity dump subcommand
 	Target            = "target"             // Target activity dump subcommand
+	InputDir          = "input-dir"          // InputDir activity dump subcommand
+	Signature         = "signature"          // Signature activity dump subcommand
+	SignatureDir      = "signature-dir"      // SignatureDir activity dump subcommand
 
 	// Security Profile Subcommand
 

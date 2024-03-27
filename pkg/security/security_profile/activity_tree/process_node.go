@@ -11,8 +11,9 @@ package activitytree
 import (
 	"fmt"
 	"io"
-	"sort"
 	"strings"
+
+	"golang.org/x/exp/maps"
 
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers"
 	sprocess "github.com/DataDog/datadog-agent/pkg/security/resolvers/process"
@@ -105,19 +106,30 @@ func (pn *ProcessNode) getNodeLabel(args string) string {
 
 // nolint: unused
 func (pn *ProcessNode) debug(w io.Writer, prefix string) {
-	fmt.Fprintf(w, "%s- process: %s (argv0: %s) (is_exec_exec:%v)\n", prefix, pn.Process.FileEvent.PathnameStr, pn.Process.Argv0, pn.Process.IsExecExec)
+	fmt.Fprintf(w, "%s- process: %s (args: %v) (is_exec_exec:%v)\n", prefix, pn.Process.FileEvent.PathnameStr, pn.Process.Argv, pn.Process.IsExecExec)
+	// if len(pn.Files) > 0 {
+	// 	fmt.Fprintf(w, "%s  files:\n", prefix)
+	// 	sortedFiles := make([]*FileNode, 0, len(pn.Files))
+	// 	for _, f := range pn.Files {
+	// 		sortedFiles = append(sortedFiles, f)
+	// 	}
+	// 	sort.Slice(sortedFiles, func(i, j int) bool {
+	// 		return sortedFiles[i].Name < sortedFiles[j].Name
+	// 	})
+	//
+	// 	for _, f := range sortedFiles {
+	// 		f.debug(w, fmt.Sprintf("%s    -", prefix))
+	// 	}
+	// }
 	if len(pn.Files) > 0 {
-		fmt.Fprintf(w, "%s  files:\n", prefix)
-		sortedFiles := make([]*FileNode, 0, len(pn.Files))
-		for _, f := range pn.Files {
-			sortedFiles = append(sortedFiles, f)
-		}
-		sort.Slice(sortedFiles, func(i, j int) bool {
-			return sortedFiles[i].Name < sortedFiles[j].Name
-		})
-
-		for _, f := range sortedFiles {
-			f.debug(w, fmt.Sprintf("%s    -", prefix))
+		files := maps.Values(pn.Files)
+		for len(files) > 0 {
+			f := files[0]
+			files = files[1:]
+			if f.File != nil {
+				fmt.Fprintf(w, "%s   + %s\n", prefix, f.File.PathnameStr)
+			}
+			files = append(files, maps.Values(f.Children)...)
 		}
 	}
 	if len(pn.DNSNames) > 0 {
@@ -152,7 +164,7 @@ func (pn *ProcessNode) scrubAndReleaseArgsEnvs(resolver *sprocess.EBPFResolver) 
 func (pn *ProcessNode) Matches(entry *model.Process, matchArgs bool, normalize bool) bool {
 	if normalize {
 		// should convert /var/run/1234/runc.pid + /var/run/54321/runc.pic into /var/run/*/runc.pid
-		match := utils.PathPatternMatch(pn.Process.FileEvent.PathnameStr, entry.FileEvent.PathnameStr, utils.PathPatternMatchOpts{WildcardLimit: 3, PrefixNodeRequired: 1, SuffixNodeRequired: 1, NodeSizeLimit: 8})
+		match := utils.PathPatternMatch(pn.Process.FileEvent.PathnameStr, entry.FileEvent.PathnameStr, utils.PathPatternMatchOpts{WildcardLimit: 3, PrefixNodeRequired: 1, NodeSizeLimit: 5})
 		if !match {
 			return false
 		}
@@ -173,12 +185,25 @@ func (pn *ProcessNode) Matches(entry *model.Process, matchArgs bool, normalize b
 		if len(panArgs) != len(entryArgs) {
 			return false
 		}
-		for i, arg := range panArgs {
-			if arg != entryArgs[i] {
-				return false
-			}
+		left := strings.Join(panArgs, " ")
+		if len(left) > 0 && left[0] != ' ' {
+			left = " " + left
 		}
-		return true
+		right := strings.Join(entryArgs, " ")
+		if len(right) > 0 && right[0] != ' ' {
+			right = " " + right
+		}
+		out := utils.PatternMatch(left, right, utils.PathPatternMatchOpts{
+			WildcardLimit: 1,
+			NodeSizeLimit: 20,
+		}, ' ')
+		return out
+		// for i, arg := range panArgs {
+		// 	if arg != entryArgs[i] {
+		// 		return false
+		// 	}
+		// }
+		// return true
 	}
 	return true
 }
@@ -202,8 +227,8 @@ newSyscallLoop:
 }
 
 // InsertFileEvent inserts the provided file event in the current node. This function returns true if a new entry was
-// added, false if the event was dropped.
-func (pn *ProcessNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Event, generationType NodeGenerationType, stats *Stats, dryRun bool, reducer *PathsReducer, resolvers *resolvers.EBPFResolvers) bool {
+// added, false if the event wasn't added and the output node depending on the dryRun parameter.
+func (pn *ProcessNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Event, generationType NodeGenerationType, stats *Stats, dryRun bool, reducer *PathsReducer, resolvers *resolvers.EBPFResolvers) (bool, *FileNode) {
 	var filePath string
 	if generationType != Snapshot {
 		filePath = event.FieldHandlers.ResolveFilePath(event, fileEvent)
@@ -217,7 +242,7 @@ func (pn *ProcessNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.
 
 	parent, nextParentIndex := ExtractFirstParent(filePath)
 	if nextParentIndex == 0 {
-		return false
+		return false, nil
 	}
 
 	child, ok := pn.Files[parent]
@@ -225,24 +250,27 @@ func (pn *ProcessNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.
 		return child.InsertFileEvent(fileEvent, event, filePath[nextParentIndex:], generationType, stats, dryRun, filePath, resolvers)
 	}
 
+	var outputNode *FileNode
 	if !dryRun {
 		// create new child
 		if len(filePath) <= nextParentIndex+1 {
 			// this is the last child, add the fileEvent context at the leaf of the files tree.
-			node := NewFileNode(fileEvent, event, parent, generationType, filePath, resolvers)
-			node.MatchedRules = model.AppendMatchedRule(node.MatchedRules, event.Rules)
+			outputNode = NewFileNode(fileEvent, event, parent, generationType, filePath, resolvers)
+			if event != nil {
+				outputNode.MatchedRules = model.AppendMatchedRule(outputNode.MatchedRules, event.Rules)
+			}
 			stats.FileNodes++
-			pn.Files[parent] = node
+			pn.Files[parent] = outputNode
 		} else {
 			// This is an intermediary node in the branch that leads to the leaf we want to add. Create a node without the
 			// fileEvent context.
 			newChild := NewFileNode(nil, nil, parent, generationType, filePath, resolvers)
-			newChild.InsertFileEvent(fileEvent, event, filePath[nextParentIndex:], generationType, stats, dryRun, filePath, resolvers)
+			_, outputNode = newChild.InsertFileEvent(fileEvent, event, filePath[nextParentIndex:], generationType, stats, dryRun, filePath, resolvers)
 			stats.FileNodes++
 			pn.Files[parent] = newChild
 		}
 	}
-	return true
+	return true, outputNode
 }
 
 func (pn *ProcessNode) findDNSNode(DNSName string, DNSMatchMaxDepth int, DNSType uint16) bool {

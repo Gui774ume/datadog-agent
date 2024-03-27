@@ -21,10 +21,11 @@ import (
 
 // Stats represents the node counts in an activity dump
 type Stats struct {
-	ProcessNodes int64
-	FileNodes    int64
-	DNSNodes     int64
-	SocketNodes  int64
+	ProcessNodes  int64
+	FileNodes     int64
+	DNSNodes      int64
+	SocketNodes   int64
+	SyscallsCount int64
 
 	processedCount map[model.EventType]*atomic.Uint64
 	addedCount     map[model.EventType]map[NodeGenerationType]*atomic.Uint64
@@ -66,6 +67,39 @@ func (stats *Stats) ApproximateSize() int64 {
 	total += stats.DNSNodes * int64(unsafe.Sizeof(DNSNode{}))         // 24
 	total += stats.SocketNodes * int64(unsafe.Sizeof(SocketNode{}))   // 40
 	return total
+}
+
+// ComputeProcessSignatureBase returns a weighted base for the process signature score computation
+func (stats *Stats) ComputeProcessSignatureBase() int {
+	return int(stats.ProcessNodes-1) * ProcessMatchWeight // -1 accounts for the top level process => the malware itself
+}
+
+// ComputeFileSignatureBase returns a weighted base for the file signature score computation
+func (stats *Stats) ComputeFileSignatureBase() int {
+	return int(stats.FileNodes) * OrderedFileMatchWeight
+}
+
+// ComputeDNSSignatureBase returns a weighted base for the DNS signature score computation
+func (stats *Stats) ComputeDNSSignatureBase() int {
+	return int(stats.DNSNodes) * DNSMatchWeight
+}
+
+// ComputeSocketSignatureBase returns a weighted base for the socket signature score computation
+func (stats *Stats) ComputeSocketSignatureBase() int {
+	return int(stats.SocketNodes) * SocketMatchWeight
+}
+
+// ComputeSyscallsBase returns a weighted base for the syscalls signature score computation
+func (stats *Stats) ComputeSyscallsBase() int {
+	return int(stats.SocketNodes) * SocketMatchWeight
+}
+
+// ComputeSignatureBase returns a weighted base for the signature score computation
+func (stats *Stats) ComputeSignatureBase() int {
+	return stats.ComputeProcessSignatureBase() +
+		stats.ComputeFileSignatureBase() +
+		stats.ComputeDNSSignatureBase() +
+		stats.ComputeSocketSignatureBase()
 }
 
 // SendStats sends metrics to Datadog

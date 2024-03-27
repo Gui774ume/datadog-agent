@@ -125,11 +125,12 @@ func (fn *FileNode) debug(w io.Writer, prefix string) {
 }
 
 // InsertFileEvent inserts an event in a FileNode. This function returns true if a new entry was added, false if
-// the event was dropped.
-func (fn *FileNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Event, remainingPath string, generationType NodeGenerationType, stats *Stats, dryRun bool, reducedPath string, resolvers *resolvers.EBPFResolvers) bool {
+// the event wasn't added and the output node depending on the dry run parameter.
+func (fn *FileNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Event, remainingPath string, generationType NodeGenerationType, stats *Stats, dryRun bool, reducedPath string, resolvers *resolvers.EBPFResolvers) (bool, *FileNode) {
 	currentFn := fn
 	currentPath := remainingPath
 	newEntry := false
+	var outputNode *FileNode
 
 	for {
 		parent, nextParentIndex := ExtractFirstParent(currentPath)
@@ -137,6 +138,7 @@ func (fn *FileNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Eve
 			if !dryRun {
 				currentFn.enrichFromEvent(event)
 			}
+			outputNode = currentFn
 			break
 		}
 
@@ -151,7 +153,8 @@ func (fn *FileNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Eve
 		newEntry = true
 		if len(currentPath) <= nextParentIndex+1 {
 			if !dryRun {
-				currentFn.Children[parent] = NewFileNode(fileEvent, event, parent, generationType, reducedPath, resolvers)
+				outputNode = NewFileNode(fileEvent, event, parent, generationType, reducedPath, resolvers)
+				currentFn.Children[parent] = outputNode
 				stats.FileNodes++
 			}
 			break
@@ -165,5 +168,5 @@ func (fn *FileNode) InsertFileEvent(fileEvent *model.FileEvent, event *model.Eve
 		currentFn = newChild
 		currentPath = currentPath[nextParentIndex:]
 	}
-	return newEntry
+	return newEntry, outputNode
 }

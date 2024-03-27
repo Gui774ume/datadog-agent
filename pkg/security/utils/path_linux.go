@@ -15,6 +15,11 @@ type PathPatternMatchOpts struct {
 
 // PathPatternMatch pattern builder for files
 func PathPatternMatch(pattern string, path string, opts PathPatternMatchOpts) bool {
+	return PatternMatch(pattern, path, opts, '/')
+}
+
+// PatternMatch pattern builder for files
+func PatternMatch(pattern string, path string, opts PathPatternMatchOpts, separator uint8) bool {
 	var (
 		i, j, offsetPath                     = 0, 0, 0
 		wildcardCount, nodeCount, suffixNode = 0, 0, 0
@@ -48,17 +53,17 @@ func PathPatternMatch(pattern string, path string, opts PathPatternMatchOpts) bo
 		}
 	)
 
-	if patternLen > 0 && pattern[0] != '/' {
+	if patternLen > 0 && pattern[0] != separator {
 		return false
 	}
 
-	if pathLen > 0 && path[0] != '/' {
+	if pathLen > 0 && path[0] != separator {
 		return false
 	}
 
 	for i < len(pattern) && j < len(path) {
 		pn, ph := pattern[i], path[j]
-		if pn == '/' && ph == '/' {
+		if pn == separator && ph == separator {
 			if !computeNode() {
 				return false
 			}
@@ -72,10 +77,10 @@ func PathPatternMatch(pattern string, path string, opts PathPatternMatchOpts) bo
 		if pn != ph {
 			wildcard = true
 		}
-		if pn != '/' {
+		if pn != separator {
 			i++
 		}
-		if ph != '/' {
+		if ph != separator {
 			j++
 		}
 	}
@@ -85,14 +90,14 @@ func PathPatternMatch(pattern string, path string, opts PathPatternMatchOpts) bo
 	}
 
 	for i < patternLen {
-		if pattern[i] == '/' {
+		if pattern[i] == separator {
 			return false
 		}
 		i++
 	}
 
 	for j < pathLen {
-		if path[j] == '/' {
+		if path[j] == separator {
 			return false
 		}
 		j++
